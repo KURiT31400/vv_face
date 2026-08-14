@@ -7,6 +7,7 @@ onnxruntime>=1.17
 rapidocr_onnxruntime>=1.3   # 背番号の読み取り（OCR / モデル16MB）
 pandas>=2.0
 Pillow>=10.0
+opencv-python-headless
 
 # numpy, opencv-python, scipy, scikit-image, tqdm は insightface が自動で導入します。
 # opencv-python-headless を別途入れると cv2 が二重になり競合するため指定していません。
