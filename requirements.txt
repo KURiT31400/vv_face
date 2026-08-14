@@ -1,0 +1,12 @@
+# 顔認証 写真仕分けアプリ 依存パッケージ
+#   pip install -r requirements.txt
+
+streamlit>=1.42
+insightface>=1.0.1   # 1.0.1 以降は純Pythonホイール（ビルド不要 / Python 3.13 対応）
+onnxruntime>=1.17
+rapidocr_onnxruntime>=1.3   # 背番号の読み取り（OCR / モデル16MB）
+pandas>=2.0
+Pillow>=10.0
+
+# numpy, opencv-python, scipy, scikit-image, tqdm は insightface が自動で導入します。
+# opencv-python-headless を別途入れると cv2 が二重になり競合するため指定していません。

@@ -1,0 +1,17 @@
+# 作業ファイル
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 一時出力
+*.zip
