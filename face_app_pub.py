@@ -944,16 +944,78 @@ def scene_folder_name(no: int, members: list[dict], assigned: list[list[str]],
                                   for n in people)
 
 
-def effective_scene(photo: dict, scene_of: dict[str, int]) -> int:
-    """この写真が属するシーン番号（0 = シーンなし）。レビューで手動指定があればそちらを優先。"""
-    if photo.get("scene") is not None:
-        return int(photo["scene"])
-    return scene_of.get(photo["path"], 0)
+MANUAL_SCENE_KEY = "手動:"   # 手動でまとめたシーンの鍵の接頭辞。後ろに作った順の通し番号が付く
+MANUAL_SCENE_MAX = 60        # 手動でまとめられる枚数の上限（範囲の選び間違いで大量に巻き込まないため）
+
+
+def manual_serial(key) -> int | None:
+    """手動シーンの鍵（「手動:3」）から通し番号を取り出す。手動シーンの鍵でなければ None。"""
+    if isinstance(key, str) and key.startswith(MANUAL_SCENE_KEY):
+        tail = key[len(MANUAL_SCENE_KEY):]
+        if tail.isdigit():
+            return int(tail)
+    return None
+
+
+def next_manual_key(over: dict) -> str:
+    """新しく手動でまとめるシーンの鍵。いま使われている通し番号の次を使う。"""
+    used = [manual_serial(v) for v in over.values()]
+    return f"{MANUAL_SCENE_KEY}{max([u for u in used if u], default=0) + 1}"
+
+
+def resolve_scenes(stamps: list[tuple[str, float]], auto_of: dict[str, int],
+                   over: dict) -> tuple[dict[str, int], dict[int, str]]:
+    """自動で見つけたシーンに、手動の指定を重ねて最終的なシーンを決める。
+
+    over: {写真名: 0（シーンに入れない） / 鍵の文字列（そのシーンに入れる） / 整数（旧形式: 自動シーンの番号）}
+    シーンの鍵は、自動のシーンでは「最も早い写真の名前」、手動でまとめたシーンでは「手動:通し番号」。
+
+    **既存のシーン番号は、手動で操作しても変わらない**ようにする。
+    - 自動のシーンの番号は、自動検出で付いた番号のまま（手動で空になっても欠番にするだけで詰めない）
+    - 手動でまとめたシーンは、自動の最後の番号の次から、作った順に付ける
+    戻り値: ({写真パス: シーン番号}, {シーン番号: 鍵})
+    """
+    t = dict(stamps)
+    earliest: dict[int, tuple[float, str]] = {}
+    for path, n in auto_of.items():
+        if path in t and (n not in earliest or (t[path], path) < earliest[n]):
+            earliest[n] = (t[path], path)
+    auto_key = {n: Path(path).name for n, (_, path) in earliest.items()}
+    number_of: dict[str, int] = {k: n for n, k in auto_key.items()}
+    last_auto = max(auto_of.values(), default=0)
+
+    members: dict[str, list[str]] = defaultdict(list)
+    for path, _ in stamps:
+        v = over.get(Path(path).name)
+        if v is None:
+            key = auto_key.get(auto_of.get(path, -1))
+        elif isinstance(v, str):
+            key = v
+        elif v == 0:
+            key = None
+        else:
+            key = auto_key.get(int(v))
+        if key:
+            members[key].append(path)
+    scene_of: dict[str, int] = {}
+    keys: dict[int, str] = {}
+    for key, paths in members.items():
+        serial = manual_serial(key)
+        if serial is not None:
+            no = last_auto + serial
+        elif key in number_of and len(paths) >= 2:
+            no = number_of[key]       # 手動で一部を移した結果1枚だけ残ったものは、シーンとして扱わない
+        else:
+            continue
+        keys[no] = key
+        for path in paths:
+            scene_of[path] = no
+    return scene_of, keys
 
 
 def build_plan(photos: list[dict], threshold: float, min_face_px: int, top_only: bool,
                min_sharp: float, sup: dict | None, scene_mode: str,
-               scene_of: dict[str, int], min_support: int,
+               scene_of: dict[str, int], min_support: int, scene_over: dict,
                ) -> tuple[dict[int, list[str]], dict[int, str]]:
     """出力・集計に使う振り分け計画を作る。
 
@@ -966,7 +1028,7 @@ def build_plan(photos: list[dict], threshold: float, min_face_px: int, top_only:
 
     「補完」「広げる」では、レビューで人物を選んで確定した写真は変更しない。
     人物なしで確定しただけ（manual が空）の写真は未確定と同じ扱いで、補完の対象になる。
-    レビューでシーンを選んだ写真（photo["scene"]）は、人物の指定よりシーンを優先する。
+    レビューでシーンを指定した写真（scene_over に入っている写真）は、人物の指定よりシーンを優先する。
     """
     base = {i: derive_assignment(p, threshold, min_face_px, top_only,
                                  min_sharp=min_sharp, sup=sup)
@@ -978,7 +1040,7 @@ def build_plan(photos: list[dict], threshold: float, min_face_px: int, top_only:
 
     members: dict[int, list[int]] = defaultdict(list)
     for i, p in enumerate(photos):
-        no = effective_scene(p, scene_of)
+        no = scene_of.get(p["path"], 0)
         if no:
             members[no].append(i)
 
@@ -994,7 +1056,7 @@ def build_plan(photos: list[dict], threshold: float, min_face_px: int, top_only:
         # 人物を手動で選んだ写真は変えない
         free = [i for i in idxs
                 if not (base[i] and photos[i].get("manual") is not None
-                        and photos[i].get("scene") is None)]
+                        and Path(photos[i]["path"]).name not in scene_over)]
         # シーン内で min_support 枚以上に確定している人物だけを「このシーンの人物」とする
         support: dict[str, int] = defaultdict(int)
         for i in idxs:
@@ -1027,11 +1089,13 @@ def state_path(image_dir: Path) -> Path:
 def save_state(image_dir: Path) -> None:
     """解析結果とレビュー内容を対象フォルダに保存する（再起動しても続きから使える）。"""
     photos = st.session_state.get("photos")
-    if not photos or not image_dir.is_dir():
+    over = st.session_state.get("scene_over") or {}
+    if (not photos and not over) or not image_dir.is_dir():
         return
     try:
         state_path(image_dir).write_text(
-            json.dumps({"version": STATE_VERSION, "photos": photos},
+            json.dumps({"version": STATE_VERSION, "photos": photos or [],
+                        "scene_over": over},
                        ensure_ascii=False),
             encoding="utf-8")
     except Exception:
@@ -1067,6 +1131,29 @@ def load_state(image_dir: Path) -> list[dict] | None:
                 continue  # 同名だが中身が差し替えられている → 未解析扱いに戻す
         photos.append(p)
     return photos or None
+
+
+def load_scene_over(image_dir: Path) -> dict:
+    """保存済みの、シーンの手動指定 {写真名: 0 または鍵}。旧形式（写真ごとの scene）も引き継ぐ。"""
+    f = state_path(image_dir)
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if data.get("version") != STATE_VERSION:
+        return {}
+    over = dict(data.get("scene_over") or {})
+    for p in data.get("photos", []):
+        if p.get("scene") is not None and p.get("name"):
+            over.setdefault(p["name"], p["scene"])
+    # 旧形式の手動シーンの鍵（手動:開始の写真名）を、通し番号の鍵（手動:1）に移す
+    old_keys = sorted({v for v in over.values() if isinstance(v, str)
+                       and v.startswith(MANUAL_SCENE_KEY) and manual_serial(v) is None})
+    if old_keys:
+        base = max([manual_serial(v) or 0 for v in over.values()], default=0)
+        moved = {k: f"{MANUAL_SCENE_KEY}{base + i}" for i, k in enumerate(old_keys, 1)}
+        over = {n: moved.get(v, v) if isinstance(v, str) else v for n, v in over.items()}
+    return over
 
 
 def merge_photos(new_photos: list[dict]) -> None:
@@ -1176,6 +1263,7 @@ ss.setdefault("photos", None)
 ss.setdefault("review_idx", 0)
 ss.setdefault("job", None)
 ss.setdefault("open_pi", None)
+ss.setdefault("scene_over", {})
 ss.setdefault("image_dir", str(DEFAULT_IMAGE))
 
 _missing = check_deps()
@@ -1339,6 +1427,9 @@ targets = list_targets(image_dir)
 # 対象フォルダを開いたとき、保存済みの作業状態があれば読み込む
 if ss.get("loaded_dir") != str(image_dir):
     restored = load_state(image_dir)
+    ss["scene_over"] = load_scene_over(image_dir)
+    for _p in restored or []:
+        _p.pop("scene", None)          # 旧形式。scene_over に移した
     ss["photos"] = restored
     ss["job"] = None
     ss["review_idx"] = 0
@@ -1348,8 +1439,10 @@ if ss.get("loaded_dir") != str(image_dir):
         st.toast(f"前回の作業状態を読み込みました（{len(restored)} 枚）")
 all_names = sorted(people.keys())
 
-# 連写のまとまり（シーン）。解析結果ではなく撮影時刻だけで決まるので、解析前でも求められる
+# 連写のまとまり（シーン）。解析結果ではなく撮影時刻と手動の指定で決まるので、解析前でも求められる
 scene_of: dict[str, int] = {}
+scene_keys: dict[int, str] = {}       # シーン番号 → 鍵（手動で入れるときに使う）
+scene_order: list[str] = []           # 撮影順の写真名
 if scene_mode != SCENE_OFF:
     _stamps = []
     for _p in targets:
@@ -1357,13 +1450,17 @@ if scene_mode != SCENE_OFF:
             _stamps.append((str(_p), capture_time(str(_p), _p.stat().st_mtime)))
         except OSError:
             pass
-    scene_of = detect_scenes(_stamps, burst_gap, link_gap,
-                             max(1, int(min_frames) - 1), bridge_gap)
+    _auto = detect_scenes(_stamps, burst_gap, link_gap,
+                          max(1, int(min_frames) - 1), bridge_gap)
+    scene_of, scene_keys = resolve_scenes(_stamps, _auto, ss["scene_over"])
+    scene_order = [Path(_p).name for _p, _t in sorted(_stamps, key=lambda x: (x[1], x[0]))]
 
 # シーン番号 → 写真名の一覧（レビュー画面でシーンを選ぶときの表示用）
 scene_names: dict[int, list[str]] = defaultdict(list)
+scene_no_by_name: dict[str, int] = {}
 for _path, _no in scene_of.items():
     scene_names[_no].append(Path(_path).name)
+    scene_no_by_name[Path(_path).name] = _no
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("登録人物数", len(people))
@@ -1524,6 +1621,7 @@ with tab_run:
         ss["photos"] = None
         ss["review_idx"] = 0
         state_path(image_dir).unlink(missing_ok=True)
+        save_state(image_dir)          # シーンの手動指定だけは残す
         st.rerun()
 
     # --- 進捗表示 ---
@@ -1797,11 +1895,42 @@ with tab_review:
                            "照合しました（観客席とみなして残りは無視）。"
                            "足りない人は「名前で追加する」から選べます。")
 
-            if scene_mode != SCENE_OFF and effective_scene(photo, scene_of):
-                no = effective_scene(photo, scene_of)
-                names_ = sorted(scene_names.get(no) or [photo["name"]])
+            if scene_mode != SCENE_OFF and photo["path"] in scene_of:
+                no = scene_of[photo["path"]]
+                names_ = sorted(scene_names[no])
                 st.caption(f"🎞 {SCENE_PREFIX}{no:02d}（{names_[0]} 〜 {names_[-1]}・{len(names_)}枚）"
-                           + ("　※手動で指定" if photo.get("scene") is not None else ""))
+                           + ("　※手動で指定" if photo["name"] in ss["scene_over"] else ""))
+
+            if scene_mode != SCENE_OFF and scene_order:
+                with st.expander("✂ シーンを手動でまとめる（連写として検出されなかった写真）"):
+                    st.caption("開始と終了の写真を選ぶと、その間（撮影順）の写真を1つのシーンにまとめます。"
+                               "自動で見つかったシーンの一部を含めても、まとめた範囲が優先されます。")
+                    i0 = scene_order.index(photo["name"]) if photo["name"] in scene_order else 0
+                    r1, r2 = st.columns(2)
+                    s_name = r1.selectbox("開始の写真", scene_order, index=i0, key=f"scs_{pi}")
+                    e_name = r2.selectbox("終了の写真", scene_order, index=i0, key=f"sce_{pi}")
+                    lo, hi = sorted((scene_order.index(s_name), scene_order.index(e_name)))
+                    span = scene_order[lo:hi + 1]
+                    in_scene = sum(1 for n in span if n in scene_no_by_name)
+                    st.caption(f"{span[0]} 〜 {span[-1]}（{len(span)}枚）"
+                               + (f"　うち {in_scene} 枚は現在シーンに入っています" if in_scene else "")
+                               + (f"　※範囲が広すぎます（上限 {MANUAL_SCENE_MAX} 枚）。"
+                                  "開始・終了の写真を確認してください"
+                                  if len(span) > MANUAL_SCENE_MAX else ""))
+                    g1, g2 = st.columns(2)
+                    if g1.button("この範囲を1つのシーンにまとめる", type="primary",
+                                 key=f"scg_{pi}",
+                                 disabled=not 2 <= len(span) <= MANUAL_SCENE_MAX):
+                        key_ = next_manual_key(ss["scene_over"])
+                        for n in span:
+                            ss["scene_over"][n] = key_
+                        save_state(image_dir)
+                        st.rerun()
+                    if g2.button("この範囲の手動指定を自動に戻す", key=f"scr_{pi}"):
+                        for n in span:
+                            ss["scene_over"].pop(n, None)
+                        save_state(image_dir)
+                        st.rerun()
 
             left, right = st.columns([3, 5])
             with left:
@@ -1868,45 +1997,54 @@ with tab_review:
                 # --- シーン（連写）への振り分け（取りこぼしを手動で入れる） ---
                 if scene_mode != SCENE_OFF:
                     sc_opts = [None, 0] + sorted(scene_names)
-                    cur_sc = photo.get("scene")
-                    if cur_sc not in sc_opts:      # シーンの分け方を変えて番号が無くなった
-                        photo.pop("scene", None)
+                    ov = ss["scene_over"].get(photo["name"])
+                    if ov is None:
                         cur_sc = None
-                    auto_no = scene_of.get(photo["path"], 0)
+                    elif isinstance(ov, str) or ov != 0:
+                        cur_sc = scene_of.get(photo["path"])
+                        if cur_sc not in sc_opts:
+                            cur_sc = None
+                    else:
+                        cur_sc = 0
+                    # 表示する値は、毎回、保存済みの指定から決め直す（番号が振り直されても合う）
+                    st.session_state[f"scene_{pi}"] = cur_sc
 
                     def _sc_fmt(v) -> str:
                         if v is None:
-                            return (f"自動（{SCENE_PREFIX}{auto_no:02d}）" if auto_no
-                                    else "自動（シーンなし）")
+                            return "自動"
                         if v == 0:
                             return "シーンに入れない"
                         ns = sorted(scene_names[v])
                         return f"{SCENE_PREFIX}{v:02d}（{ns[0]} 〜 {ns[-1]}・{len(ns)}枚）"
 
-                    sc_pick = st.selectbox(
-                        "シーン（連写）への振り分け", sc_opts, index=sc_opts.index(cur_sc),
-                        format_func=_sc_fmt, key=f"scene_{pi}",
+                    def _sc_changed(pi_: int, name_: str) -> None:
+                        v = st.session_state.get(f"scene_{pi_}")
+                        if v is None:
+                            ss["scene_over"].pop(name_, None)
+                        elif v == 0:
+                            ss["scene_over"][name_] = 0
+                        else:
+                            ss["scene_over"][name_] = scene_keys[v]
+                        save_state(image_dir)
+
+                    st.selectbox(
+                        "シーン（連写）への振り分け", sc_opts, format_func=_sc_fmt,
+                        key=f"scene_{pi}", on_change=_sc_changed, args=(pi, photo["name"]),
                         help="連写として検出できなかった写真を、手動でシーンに入れられます。"
                              "「シーンに入れない」を選ぶと、この写真だけシーン処理の対象外になります。"
-                             "人物の指定よりシーンの選択が優先されます。",
+                             "人物の指定よりシーンの選択が優先されます。"
+                             "複数の写真をまとめて新しいシーンにするときは、上の「シーンを手動でまとめる」を使います。",
                     )
-                    if sc_pick != photo.get("scene"):
-                        if sc_pick is None:
-                            photo.pop("scene", None)
-                        else:
-                            photo["scene"] = sc_pick
-                        save_state(image_dir)
-                        st.rerun()          # 画像上の「🎞 シーン」表示も更新する
 
                 # --- 仕分け先 ---
                 assigned = sorted({n for n in selections if n} | set(extra))
                 dest = [short_label(n) for n in assigned]
-                eff_no = effective_scene(photo, scene_of) if scene_mode != SCENE_OFF else 0
+                eff_no = scene_of.get(photo["path"], 0) if scene_mode != SCENE_OFF else 0
                 if scene_mode == SCENE_FOLDER and eff_no:
                     # シーンの写真は人物フォルダへ入れない。人物名つきのフォルダ名を計画から取る
                     plan_all, _ = build_plan(photos, threshold, min_face_px, top_only,
                                              min_sharp, sup, scene_mode, scene_of,
-                                             int(min_support))
+                                             int(min_support), ss["scene_over"])
                     dest = plan_all[pi]
                 st.info("仕分け先: " + ("、".join(dest) or f"{OTHER_NAME}（該当なし）"))
                 st.caption("変更は別の写真へ移ったときに自動保存されます"
@@ -2017,7 +2155,8 @@ with tab_apply:
     else:
         photos = ss["photos"]
         plan, scene_notes = build_plan(photos, threshold, min_face_px, top_only, min_sharp,
-                                       sup, scene_mode, scene_of, int(min_support))
+                                       sup, scene_mode, scene_of, int(min_support),
+                                       ss["scene_over"])
         counter: dict[str, int] = defaultdict(int)
         for names in plan.values():
             for n in names:
@@ -2098,7 +2237,8 @@ with tab_result:
 
         photos = ss["photos"]
         plan, scene_notes = build_plan(photos, threshold, min_face_px, top_only, min_sharp,
-                                       sup, scene_mode, scene_of, int(min_support))
+                                       sup, scene_mode, scene_of, int(min_support),
+                                       ss["scene_over"])
         counter: dict[str, int] = defaultdict(int)
         for names in plan.values():
             for n in names:
@@ -2129,8 +2269,8 @@ with tab_result:
                     "確定": (scene_notes.get(i)
                              or ("手動" if p.get("manual") is not None
                                  else ("観客席（一部）" if p.get("crowd") else "自動"))),
-                    "シーン": (f"{SCENE_PREFIX}{effective_scene(p, scene_of):02d}"
-                              if scene_mode != SCENE_OFF and effective_scene(p, scene_of)
+                    "シーン": (f"{SCENE_PREFIX}{scene_of[p['path']]:02d}"
+                              if scene_mode != SCENE_OFF and p["path"] in scene_of
                               else "—"),
                     "判定人物": ", ".join(n if is_scene_name(n) else short_label(n)
                                       for n in plan[i]) or "—",
