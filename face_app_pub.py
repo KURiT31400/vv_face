@@ -1779,12 +1779,16 @@ with tab_review:
 
                 # いま選ばれている状態（前回描画時の値）。画面上の並びを入れ替えるために使う
                 selections: list[str | None] = []
+                current_of: list[str] = []
+                checked_of: list[bool] = []
                 for k, (_, options, default, default_on, _) in enumerate(face_setup):
                     name = st.session_state.get(f"rev_{pi}_{k}", default)
                     if name not in options:
                         name = default
-                    selections.append(
-                        name if st.session_state.get(f"use_{pi}_{k}", default_on) else None)
+                    on = bool(st.session_state.get(f"use_{pi}_{k}", default_on))
+                    current_of.append(name)
+                    checked_of.append(on)
+                    selections.append(name if on else None)
 
                 # --- 背番号 ---
                 num_names = list(photo.get("num_names") or [])
@@ -1822,47 +1826,7 @@ with tab_review:
                            "人物が違うときは下のプルダウンで選び直せます。"
                            "変更内容は上の「仕分け先」に反映されます。")
 
-                if photo["faces"]:
-                    PER_ROW = 4
-                    for row0 in range(0, len(photo["faces"]), PER_ROW):
-                        cols = st.columns(PER_ROW)
-                        for col, k in zip(cols, range(row0, min(row0 + PER_ROW,
-                                                                len(photo["faces"])))):
-                            f = photo["faces"][k]
-                            score_map, options, default, default_on, ok = face_setup[k]
-                            sel_key = f"rev_{pi}_{k}"
-                            current = st.session_state.get(sel_key, default)
-                            if current not in options:
-                                current = default
-
-                            with col:
-                                if img is not None:
-                                    st.image(crop_face(img, f["bbox"]),
-                                             use_container_width=True)
-                                st.checkbox(
-                                    short_label(current)
-                                    + (f"　{score_map[current]:.2f}" if current in score_map else ""),
-                                    value=default_on, key=f"use_{pi}_{k}",
-                                )
-                                st.selectbox(
-                                    f"顔 {k + 1}", options,
-                                    index=options.index(current),
-                                    key=sel_key, label_visibility="collapsed",
-                                    format_func=lambda n: (
-                                        f"{short_label(n)}　({score_map[n]:.3f})"
-                                        if n in score_map else short_label(n)),
-                                )
-                                note = f"顔{k + 1} / {f['size']}px"
-                                if "sharp" in f:
-                                    note += f" / ボケ度 {f['sharp']:.0f}"
-                                if is_supporter[k]:
-                                    note += "（サポーターとみなして対象外）"
-                                elif not ok:
-                                    note += "（対象外）"
-                                st.caption(note)
-                else:
-                    st.caption("顔は検出されませんでした。")
-
+                # ボタンは顔の一覧より先に置く（「その他」の顔が多くても、下までスクロールしない）
                 b1, b2, b3 = st.columns(3)
                 if b1.button("確定して次へ", type="primary", key=f"ok_{pi}"):
                     photo["manual_faces"] = selections
@@ -1885,6 +1849,71 @@ with tab_review:
                     for key in ("manual", "manual_faces", "manual_extra"):
                         photo.pop(key, None)
                     st.rerun()
+
+                def face_card(k: int) -> None:
+                    f = photo["faces"][k]
+                    score_map, options, default, default_on, ok = face_setup[k]
+                    sel_key = f"rev_{pi}_{k}"
+                    current = st.session_state.get(sel_key, default)
+                    if current not in options:
+                        current = default
+                    if img is not None:
+                        st.image(crop_face(img, f["bbox"]), use_container_width=True)
+                    st.checkbox(
+                        short_label(current)
+                        + (f"　{score_map[current]:.2f}" if current in score_map else ""),
+                        value=default_on, key=f"use_{pi}_{k}",
+                    )
+                    st.selectbox(
+                        f"顔 {k + 1}", options,
+                        index=options.index(current),
+                        key=sel_key, label_visibility="collapsed",
+                        format_func=lambda n: (
+                            f"{short_label(n)}　({score_map[n]:.3f})"
+                            if n in score_map else short_label(n)),
+                    )
+                    note = f"顔{k + 1} / {f['size']}px"
+                    if "sharp" in f:
+                        note += f" / ボケ度 {f['sharp']:.0f}"
+                    if is_supporter[k]:
+                        note += "（サポーターとみなして対象外）"
+                    elif not ok:
+                        note += "（対象外）"
+                    st.caption(note)
+
+                def face_grid(ks: list[int]) -> None:
+                    PER_ROW = 4
+                    for row0 in range(0, len(ks), PER_ROW):
+                        cols = st.columns(PER_ROW)
+                        for col, k in zip(cols, ks[row0:row0 + PER_ROW]):
+                            with col:
+                                face_card(k)
+
+                if photo["faces"]:
+                    # 仕分ける顔（チェックあり）→ 一覧の人でチェックなし → チェックなしの「その他」。
+                    # 同じ区分の中では、いま選ばれている人物の類似度が高い順。
+                    def _rank(k: int) -> tuple:
+                        g = 0 if checked_of[k] else (2 if current_of[k] == OTHER_NAME else 1)
+                        return (g, -face_setup[k][0].get(current_of[k], 0.0), k)
+
+                    order = sorted(range(len(photo["faces"])), key=_rank)
+                    on_ks = [k for k in order if _rank(k)[0] == 0]
+                    cand_ks = [k for k in order if _rank(k)[0] == 1]
+                    other_ks = [k for k in order if _rank(k)[0] == 2]
+
+                    if on_ks:
+                        st.markdown(f"**✅ 仕分ける顔（{len(on_ks)}）**")
+                        face_grid(on_ks)
+                    if cand_ks:
+                        st.markdown(f"**候補あり・チェックなし（{len(cand_ks)}）**")
+                        face_grid(cand_ks)
+                    if other_ks:
+                        with st.expander(
+                                f"チェックなしの「{OTHER_NAME}」の顔（{len(other_ks)}）"
+                                "　※観客席・サポーターなど", expanded=False):
+                            face_grid(other_ks)
+                else:
+                    st.caption("顔は検出されませんでした。")
 
 # ---------------------------------------------------------------- 出力タブ
 
