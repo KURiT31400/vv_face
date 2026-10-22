@@ -1,23 +1,26 @@
 """
-顔認証 写真仕分けアプリ for vvaren NAGASAKI（公開版）
-==================================================================
-- 対象写真はブラウザからアップロード
-- 仕分け結果は ZIP でダウンロード
+顔認証による写真仕分け Streamlit アプリ
+======================================
+- ref/  : 参照画像（ファイル名 = 人物名）。サブフォルダ形式にも対応。
+- image/: 仕分け対象の写真
+- output/<人物名>/ に該当写真をコピー
 
-エンジン: InsightFace (buffalo_l) / CPU
+フロー: ① 参照登録 → ② 全件解析 → ③ 複数顔写真をレビュー → ④ ファイル出力
+エンジン: InsightFace (buffalo_l)
 """
 
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import re
-import tempfile
+import shutil
+import subprocess
+import sys
 import time
 import unicodedata
-import zipfile
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -26,30 +29,34 @@ import streamlit as st
 # ---------------------------------------------------------------- 定数
 
 APP_DIR = Path(__file__).resolve().parent
-REF_DIR = APP_DIR / "ref"          # リポジトリ同梱の参照画像
-README_PATH = APP_DIR / "README.md"
+DEFAULT_REF = APP_DIR / "ref"
+DEFAULT_IMAGE = APP_DIR / "image"
+DEFAULT_OUTPUT = APP_DIR / "output"
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 UPLOAD_TYPES = ["jpg", "jpeg", "png", "bmp", "webp"]
 
+# 参照画像のファイル名の付け方（アップロード画面に表示）
 NAMING_RULE = (
     "**ファイル名（拡張子を除いた部分）がそのまま人物名になります。**"
-    "選手は `MF05_山田太郎.jpg` のように「ポジション+背番号_氏名」、"
-    "スタッフ・関係者は `コーチ_田中三郎.jpg` `MC_鈴木五郎.jpg` のように「役職_氏名」で"
-    "保存してください（同じ人物名を追加すると上書きされます）。"
+    "選手は `MF05_山口蛍.jpg` のように「ポジション+背番号_氏名」、"
+    "スタッフ・関係者は `コーチ_伊藤彰.jpg` `MC_初村さん.jpg` のように「役職_氏名」で"
+    "保存してください（同じ人物名のファイルを追加すると上書きされます）。"
 )
-TOP_K = 8
+TOP_K = 8  # 1顔あたり保存する候補数
+# 一覧にない人物・誰にも該当しなかった写真の共通の出力先
 OTHER_NAME = "その他"
 OTHER_LABEL = "その他（一覧にない人）"
-CHUNK_SECONDS = 1.5
-MAX_FILES = 200            # 一度に扱える写真の枚数
-MAX_SIDE = 2000            # 解析時に長辺をこのサイズへ縮小（サーバーのメモリ対策）
-ZIP_WARN_MB = 200
-ZIP_LIMIT_MB = 500
+CHUNK_SECONDS = 1.5  # この秒数ごとに画面へ制御を戻す（一時停止・中止の応答用）
 
+# 中の各ファイルを「役職_氏名」として1人ずつ登録するフォルダ（フォルダ名 → グループ名）
 ROLE_DIRS = {"staff": "staff", "スタッフ": "staff", "etc": "etc", "その他": "etc"}
 STAFF_GROUP = "staff"
+
+# 一覧表示用のグループ並び順（SP = マスコットなど / etc = MC など）
 POS_ORDER = ["GK", "DF", "MF", "FF", "FW", "監督", "SP", STAFF_GROUP, "etc", "その他"]
+
+# staff グループ内での役職の並び順（未定義の役職は末尾に五十音順）
 STAFF_ROLE_ORDER = {
     "監督": 0, "ヘッドコーチ": 1, "アシスタントコーチ": 2, "コーチ": 3,
     "GKコーチ": 4, "フィジカルコーチ": 5, "分析コーチ": 6,
@@ -61,6 +68,18 @@ st.set_page_config(page_title="顔認証 写真仕分け", page_icon="🧑‍�
 
 
 # ---------------------------------------------------------------- モデル
+
+
+INSTALL_HINT = f"""
+このアプリを動かしている Python に `insightface` が入っていません。
+ターミナルで次を実行してください（このアプリを起動している Python 環境に入れる必要があります）：
+
+```bash
+"{Path(sys.executable)}" -m pip install insightface onnxruntime
+```
+
+インストール後、ブラウザのページを再読み込み（⌘R）してください。
+"""
 
 
 def check_deps() -> list[str]:
@@ -86,18 +105,22 @@ def get_model(det_size: int = 640, det_thresh: float = 0.50):
     """モデル取得。失敗時は分かりやすいエラーを出して停止する。"""
     try:
         return load_model(det_size, det_thresh)
-    except ModuleNotFoundError as e:
-        st.error(f"**必要なライブラリがありません: {e.name}**\n\n"
-                 "`requirements.txt` を確認してください。")
+    except ModuleNotFoundError:
+        st.error("**顔認識ライブラリが見つかりません**")
+        st.markdown(INSTALL_HINT)
         st.stop()
     except Exception as e:
         st.error(f"**モデルの読み込みに失敗しました**\n\n```\n{type(e).__name__}: {e}\n```")
-        st.info("初回はモデル（約300MB）を自動ダウンロードします。"
-                "時間をおいて再読み込みしてください。")
+        st.markdown(
+            "初回起動時は buffalo_l モデル（約 300MB）を GitHub からダウンロードします。"
+            "ネットワークに接続しているか確認してください。\n\n"
+            "手動で配置する場合は `~/.insightface/models/buffalo_l/` に "
+            "`det_10g.onnx` などの .onnx ファイルを置いてください。"
+        )
         st.stop()
 
 
-def read_image(path: Path, max_side: int = MAX_SIDE) -> np.ndarray | None:
+def read_image(path: Path, max_side: int = 0) -> np.ndarray | None:
     """日本語パス対応の画像読み込み（BGR）。EXIF回転も反映。
 
     max_side を指定すると長辺をそのサイズまで縮小する（0 は原寸）。
@@ -124,6 +147,136 @@ def read_image(path: Path, max_side: int = MAX_SIDE) -> np.ndarray | None:
 def normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v / n if n > 0 else v
+
+
+# ---------------------------------------------------------------- フォルダ選択
+
+
+def normalize_path_input(text: str) -> str:
+    """入力欄の値を整える。Finder からドラッグした file:// URL や引用符も受け付ける。"""
+    s = (text or "").strip().strip('"').strip("'")
+    if s.startswith("file://"):
+        from urllib.parse import unquote, urlparse
+
+        s = unquote(urlparse(s).path)
+    return s.rstrip("/") or s
+
+
+def pick_folder_dialog(initial: str = "") -> str | None:
+    """OS のフォルダ選択画面を開く。別プロセスで tkinter を起動する。
+
+    Streamlit のスクリプトはメインスレッドで動かないため、直接 tkinter を呼ぶと
+    macOS では落ちることがある。そのため子プロセスに任せている。
+    利用できない環境（tkinter 未導入・サーバー実行など）では None を返す。
+    """
+    code = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "r = tk.Tk(); r.withdraw()\n"
+        "try:\n"
+        "    r.call('wm', 'attributes', '.', '-topmost', True)\n"
+        "except Exception:\n"
+        "    pass\n"
+        f"p = filedialog.askdirectory(initialdir={initial!r} or None, title='フォルダを選択')\n"
+        "print(p or '')\n"
+    )
+    try:
+        out = subprocess.run([sys.executable, "-c", code],
+                             capture_output=True, text=True, timeout=300)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or ""
+
+
+def subfolders(path: Path) -> list[Path]:
+    try:
+        return sorted((p for p in path.iterdir()
+                       if p.is_dir() and not p.name.startswith(".")),
+                      key=lambda p: p.name.lower())
+    except Exception:
+        return []
+
+
+def count_images(path: Path) -> int:
+    try:
+        return sum(1 for p in path.iterdir() if p.suffix.lower() in IMG_EXTS)
+    except Exception:
+        return 0
+
+
+@st.dialog("📂 フォルダを選択", width="large")
+def folder_dialog(key: str, title: str):
+    """OS のダイアログ、またはアプリ内のフォルダ一覧から選ぶ。"""
+    st.markdown(f"**{title}**")
+    current = Path(st.session_state.get(f"{key}_browse") or st.session_state[key])
+    if not current.is_dir():
+        current = APP_DIR
+
+    if st.button("🖥 PC のフォルダ選択画面を開く", type="primary", use_container_width=True):
+        picked = pick_folder_dialog(str(current))
+        if picked is None:
+            st.error("この環境では OS のフォルダ選択画面を開けませんでした。"
+                     "下の一覧から選ぶか、パスを直接入力してください。")
+        elif picked:
+            st.session_state[key] = picked
+            st.rerun()
+
+    st.divider()
+    st.caption(f"現在の場所: `{current}`　（画像 {count_images(current)} 枚）")
+
+    nav = st.columns([1, 1, 3])
+    if nav[0].button("⬆️ 上の階層へ", use_container_width=True,
+                     disabled=current.parent == current):
+        st.session_state[f"{key}_browse"] = str(current.parent)
+        st.rerun()
+    if nav[1].button("🏠 アプリの場所", use_container_width=True):
+        st.session_state[f"{key}_browse"] = str(APP_DIR)
+        st.rerun()
+    if nav[2].button("✅ この場所に決定", type="primary", use_container_width=True):
+        st.session_state[key] = str(current)
+        st.rerun()
+
+    subs = subfolders(current)
+    if subs:
+        st.caption("サブフォルダ（クリックで移動）")
+        PER_ROW = 3
+        for i in range(0, len(subs), PER_ROW):
+            cols = st.columns(PER_ROW)
+            for col, d in zip(cols, subs[i:i + PER_ROW]):
+                n = count_images(d)
+                if col.button(f"📁 {d.name}" + (f"（{n}枚）" if n else ""),
+                              key=f"{key}_dir_{d}", use_container_width=True):
+                    st.session_state[f"{key}_browse"] = str(d)
+                    st.rerun()
+    else:
+        st.caption("このフォルダにサブフォルダはありません。")
+
+    st.divider()
+    typed = st.text_input("パスを直接入力（Finder からフォルダをドラッグ＆ドロップも可）",
+                          str(current), key=f"{key}_typed")
+    if st.button("入力したパスに決定", use_container_width=True):
+        p = normalize_path_input(typed)
+        if Path(p).is_dir():
+            st.session_state[key] = p
+            st.rerun()
+        else:
+            st.error(f"フォルダが見つかりません: {p}")
+
+
+def folder_row(key: str, label: str) -> Path:
+    """サイドバー用。現在のフォルダ名と「変更」ボタンを出す。"""
+    path = Path(st.session_state[key])
+    st.caption(f"**{label}**")
+    c1, c2 = st.columns([3, 1])
+    c1.code(path.name or str(path), language=None)
+    if c2.button("変更", key=f"{key}_btn", use_container_width=True):
+        st.session_state[f"{key}_browse"] = str(path)
+        folder_dialog(key, label)
+    if not path.is_dir():
+        st.warning("フォルダが見つかりません")
+    return path
 
 
 # ---------------------------------------------------------------- 人物名の解析
@@ -356,83 +509,6 @@ def collect_refs(ref_dir: Path) -> dict[str, list[Path]]:
 
     ROLE_MEMBERS = roles
     return people
-
-
-def collect_all_refs(base_dir: Path, extra_dir: Path) -> dict[str, list[Path]]:
-    """同梱の参照画像と、このセッションで追加された参照画像をまとめる。"""
-    global ROLE_MEMBERS
-    base = collect_refs(base_dir)
-    roles = dict(ROLE_MEMBERS)
-    extra = collect_refs(extra_dir)
-    roles.update(ROLE_MEMBERS)
-    merged = {k: list(v) for k, v in base.items()}
-    for name, files in extra.items():
-        merged.setdefault(name, []).extend(files)
-    ROLE_MEMBERS = roles
-    return merged
-
-
-def safe_name(name: str) -> str:
-    """ZIP 内のフォルダ名として安全な文字列にする（Windows対応・NFC正規化）。"""
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", nfc(name)).strip(" .")
-    return cleaned or "unknown"
-
-
-def estimate_zip_size(plan: dict, photos: list[dict], include_unmatched: bool) -> int:
-    total = 0
-    for i, names in plan.items():
-        src = Path(photos[i]["path"])
-        if not src.exists():
-            continue
-        copies = len(names) if names else (1 if include_unmatched else 0)
-        total += src.stat().st_size * copies
-    return total
-
-
-def shrink_bytes(src: Path, max_side: int, quality: int = 88) -> bytes:
-    from PIL import Image, ImageOps
-
-    try:
-        with Image.open(src) as im:
-            im = ImageOps.exif_transpose(im).convert("RGB")
-            if max(im.size) > max_side:
-                r = max_side / max(im.size)
-                im = im.resize((int(im.width * r), int(im.height * r)), Image.LANCZOS)
-            buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=quality, optimize=True)
-            return buf.getvalue()
-    except Exception:
-        return src.read_bytes()
-
-
-def build_zip(plan: dict, photos: list[dict], include_unmatched: bool,
-              shrink_to: int | None = None, progress=None) -> bytes:
-    """人物名フォルダごとに写真を格納した ZIP を作る。"""
-    buf = io.BytesIO()
-    items = list(plan.items())
-    written: set[str] = set()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
-        for j, (i, names) in enumerate(items, 1):
-            src = Path(photos[i]["path"])
-            if not src.exists():
-                continue
-            dests = names if names else ([OTHER_NAME] if include_unmatched else [])
-            if not dests:
-                continue
-            data = shrink_bytes(src, shrink_to) if shrink_to else src.read_bytes()
-            fname = photos[i]["name"]
-            if shrink_to:
-                fname = f"{Path(fname).stem}.jpg"
-            for n in dests:
-                entry = f"{safe_name(n)}/{fname}"
-                if entry in written:
-                    continue
-                zf.writestr(entry, data)
-                written.add(entry)
-            del data
-            if progress:
-                progress(j / len(items))
-    return buf.getvalue()
 
 
 def list_targets(image_dir: Path) -> list[Path]:
@@ -681,8 +757,52 @@ def usable_face(f: dict, min_face_px: int, min_sharp: float) -> bool:
     return f["size"] >= min_face_px and (not min_sharp or f.get("sharp", 1e9) >= min_sharp)
 
 
+def supporter_mask(faces: list[dict], min_face_px: int, sup: dict | None) -> list[bool]:
+    """サポーター（観客）とみなして無視する顔に True を付ける。
+
+    その写真で一番大きく写っている顔（＝主役）に比べて、**大きさも鮮明度も**
+    一定の比率に満たない顔を無視する。どちらか一方だけなら残す
+    （遠くの選手や、動いてブレた選手を巻き込まないため）。
+    """
+    mask = [False] * len(faces)
+    if not sup or not (sup["rel_size"] or sup["rel_sharp"]):
+        return mask
+    main = sorted(((f["size"], f.get("sharp", 0.0)) for f in faces
+                   if f["size"] >= min_face_px), reverse=True)[:3]
+    if len(main) < 2:
+        return mask           # 比べる相手がいない
+    ref_size = main[0][0]
+    ref_sharp = max(s for _, s in main)
+    for k, f in enumerate(faces):
+        small = not sup["rel_size"] or f["size"] < ref_size * sup["rel_size"]
+        soft = not sup["rel_sharp"] or f.get("sharp", 1e9) < ref_sharp * sup["rel_sharp"]
+        mask[k] = small and soft
+    return mask
+
+
+def face_threshold(f: dict, threshold: float, sup: dict | None) -> float:
+    """小さい顔は特徴が乏しく誤認識しやすいので、しきい値を上乗せする。"""
+    if sup and sup["small_bonus"] and f["size"] < sup["small_px"]:
+        return threshold + sup["small_bonus"]
+    return threshold
+
+
+def is_ambiguous(f: dict, sup: dict | None) -> bool:
+    """1位と2位の類似度が近すぎて、誰とも言い切れない顔か。"""
+    c = f["cands"]
+    return bool(sup and sup["margin"] and len(c) > 1 and c[0][1] - c[1][1] < sup["margin"])
+
+
+def top_confident(f: dict, threshold: float, sup: dict | None) -> bool:
+    """1位の候補を自動で採用してよい顔か（しきい値・小顔の上乗せ・曖昧さを考慮）。"""
+    c = f["cands"]
+    return bool(c and c[0][1] >= face_threshold(f, threshold, sup)
+                and not is_ambiguous(f, sup))
+
+
 def derive_assignment(photo: dict, threshold: float, min_face_px: int, top_only: bool,
-                      use_numbers: bool = True, min_sharp: float = 0.0) -> list[str]:
+                      use_numbers: bool = True, min_sharp: float = 0.0,
+                      sup: dict | None = None) -> list[str]:
     """保存済み候補と現在のパラメータから、この写真に割り当てる人物名を決める。
     手動確定済み(manual)があればそれを優先。
     顔で誰も判定できなかった場合のみ、背番号 OCR の結果を使う。"""
@@ -691,15 +811,20 @@ def derive_assignment(photo: dict, threshold: float, min_face_px: int, top_only:
         return sorted({n for n in manual if n})
 
     names: dict[str, float] = {}
-    for f in photo["faces"]:
-        if not usable_face(f, min_face_px, min_sharp):
+    ignored = supporter_mask(photo["faces"], min_face_px, sup)
+    for f, skip in zip(photo["faces"], ignored):
+        if skip or not usable_face(f, min_face_px, min_sharp):
             continue
         cands = f["cands"]
         if not cands:
             continue
-        picks = cands[:1] if top_only else cands
-        for n, s in picks:
-            if s >= threshold and s > names.get(n, -1):
+        if top_only:
+            if top_confident(f, threshold, sup) and cands[0][1] > names.get(cands[0][0], -1):
+                names[cands[0][0]] = cands[0][1]
+            continue
+        thr = face_threshold(f, threshold, sup)
+        for n, s in cands:
+            if s >= thr and s > names.get(n, -1):
                 names[n] = s
     if names:
         return sorted(names, key=lambda n: -names[n])
@@ -712,6 +837,135 @@ def derive_assignment(photo: dict, threshold: float, min_face_px: int, top_only:
 def selections_have_person(selections: list[str | None]) -> bool:
     """顔のプルダウンで「その他」以外の人物が選ばれているか。"""
     return any(s and s != OTHER_NAME for s in selections)
+
+
+# ---------------------------------------------------------------- シーン（連写）
+
+SCENE_PREFIX = "シーン"
+SCENE_OFF = "使わない"
+SCENE_FILL = "未判定の写真だけ補完"
+SCENE_EXPAND = "シーン内の全写真に人物を広げる"
+SCENE_FOLDER = "シーンごとのフォルダにまとめる"
+
+
+def is_scene_name(name: str) -> bool:
+    return name.startswith(SCENE_PREFIX)
+
+
+@st.cache_data(show_spinner=False)
+def capture_time(path_str: str, mtime: float) -> float:
+    """撮影時刻（EXIF・秒未満つき）。取れなければファイルの更新日時。"""
+    from PIL import Image
+
+    try:
+        with Image.open(path_str) as im:
+            ex = im.getexif()
+            sub = ex.get_ifd(0x8769)
+            t = datetime.strptime(str(sub.get(36867) or ex.get(306)),
+                                  "%Y:%m:%d %H:%M:%S").timestamp()
+            frac = str(sub.get(37521) or "").strip()
+            return t + (float("0." + frac) if frac.isdigit() else 0.0)
+    except Exception:
+        return mtime
+
+
+def detect_scenes(stamps: list[tuple[str, float]], burst_gap: float, link_gap: float,
+                  min_bursts: int, bridge_gap: float) -> dict[str, int]:
+    """撮影間隔から連写のまとまり（シーン）を見つける。{写真パス: シーン番号（時刻順に1から）}
+
+    1. 隣り合う写真の間隔が link_gap 以下ならつなぐ（鎖）。
+    2. 鎖の中に burst_gap 以下の間隔（連写）が min_bursts 個以上あればシーン。
+       手で1枚ずつ撮った写真は間隔が長いので、つながってもシーンにならない。
+    3. 連写が1つだけの短い鎖は、bridge_gap 以内にシーンがあれば、そのシーンに合流する。
+    画像の見た目の類似度は使わない（ズームや動きで似なくなる連写があるため）。
+    """
+    order = sorted(stamps, key=lambda x: (x[1], x[0]))
+    if len(order) < 2:
+        return {}
+    t = [x[1] for x in order]
+    chains: list[list[int]] = [[0]]
+    for i in range(1, len(order)):
+        if t[i] - t[i - 1] <= link_gap:
+            chains[-1].append(i)
+        else:
+            chains.append([i])
+
+    def bursts(c: list[int]) -> int:
+        return sum(1 for a, b in zip(c, c[1:]) if t[b] - t[a] <= burst_gap)
+
+    core = [bursts(c) >= min_bursts for c in chains]
+    group = {k: k for k, is_core in enumerate(core) if is_core}
+    for k, c in enumerate(chains):
+        if core[k] or bursts(c) < 1:
+            continue
+        near = []
+        if k > 0 and core[k - 1]:
+            near.append((t[c[0]] - t[chains[k - 1][-1]], k - 1))
+        if k + 1 < len(chains) and core[k + 1]:
+            near.append((t[chains[k + 1][0]] - t[c[-1]], k + 1))
+        near = [x for x in near if x[0] <= bridge_gap]
+        if near:
+            group[k] = min(near)[1]
+    heads = sorted(set(group.values()))
+    number = {h: n for n, h in enumerate(heads, 1)}
+    out: dict[str, int] = {}
+    for k, c in enumerate(chains):
+        if k in group:
+            for i in c:
+                out[order[i][0]] = number[group[k]]
+    return out
+
+
+def build_plan(photos: list[dict], threshold: float, min_face_px: int, top_only: bool,
+               min_sharp: float, sup: dict | None, scene_mode: str,
+               scene_of: dict[str, int], min_support: int, keep_persons: bool,
+               ) -> tuple[dict[int, list[str]], dict[int, str]]:
+    """出力・集計に使う振り分け計画を作る。
+
+    戻り値: ({写真の番号: [フォルダ名]}, {写真の番号: シーン処理で変えた内容の注記})。
+    レビューで確定した写真（manual）は、シーン処理で変更しない。
+    """
+    base = {i: derive_assignment(p, threshold, min_face_px, top_only,
+                                 min_sharp=min_sharp, sup=sup)
+            for i, p in enumerate(photos)}
+    plan = {i: list(n) for i, n in base.items()}
+    notes: dict[int, str] = {}
+    if scene_mode == SCENE_OFF or not scene_of:
+        return plan, notes
+
+    members: dict[int, list[int]] = defaultdict(list)
+    for i, p in enumerate(photos):
+        no = scene_of.get(p["path"])
+        if no:
+            members[no].append(i)
+
+    for no, idxs in members.items():
+        label = f"{SCENE_PREFIX}{no:02d}"
+        free = [i for i in idxs if photos[i].get("manual") is None]
+        if scene_mode == SCENE_FOLDER:
+            for i in free:
+                plan[i] = [label] + (base[i] if keep_persons else [])
+                notes[i] = label
+            continue
+        # シーン内で min_support 枚以上に確定している人物だけを「このシーンの人物」とする
+        support: dict[str, int] = defaultdict(int)
+        for i in idxs:
+            for n in base[i]:
+                support[n] += 1
+        strong = [n for n, c in sorted(support.items(), key=lambda x: -x[1])
+                  if c >= min_support]
+        for i in free:
+            if scene_mode == SCENE_FILL:
+                # 人物が1人に絞れるシーンだけ。複数人が食い違うシーンは補完しない
+                if not base[i] and len(strong) == 1:
+                    plan[i] = list(strong)
+                    notes[i] = f"{label}から補完"
+            else:
+                add = [n for n in strong if n not in base[i]]
+                if add:
+                    plan[i] = base[i] + add
+                    notes[i] = f"{label}から追加"
+    return plan, notes
 
 
 STATE_FILE = ".face_sorting.json"   # 対象フォルダに置く作業状態
@@ -737,7 +991,12 @@ def save_state(image_dir: Path) -> None:
 
 
 def load_state(image_dir: Path) -> list[dict] | None:
-    """保存済みの作業状態を読み込む。ファイルが消えている写真は除く。"""
+    """保存済みの作業状態を読み込む。
+
+    ファイルが消えている写真は除く。同名のまま中身が差し替えられた写真も、
+    サイズ・更新日時が記録と食い違っていれば古い解析結果を捨てて未解析扱いに戻す
+    （指紋情報が無い旧形式の記録はそのまま信用する）。
+    """
     f = state_path(image_dir)
     if not f.is_file():
         return None
@@ -747,7 +1006,18 @@ def load_state(image_dir: Path) -> list[dict] | None:
         return None
     if data.get("version") != STATE_VERSION:
         return None
-    photos = [p for p in data.get("photos", []) if Path(p.get("path", "")).exists()]
+    photos = []
+    for p in data.get("photos", []):
+        path = Path(p.get("path", ""))
+        try:
+            st = path.stat()
+        except OSError:
+            continue  # 写真が消えている
+        rec_mtime, rec_size = p.get("mtime"), p.get("fsize")
+        if rec_mtime is not None and rec_size is not None:
+            if int(st.st_mtime) != rec_mtime or st.st_size != rec_size:
+                continue  # 同名だが中身が差し替えられている → 未解析扱いに戻す
+        photos.append(p)
     return photos or None
 
 
@@ -761,19 +1031,33 @@ def merge_photos(new_photos: list[dict]) -> None:
     st.session_state["photos"] = merged
 
 
+def put_file(src: Path, dest_dir: Path, move: bool = False) -> Path:
+    """出力先へ配置する。同名ファイルが既にあれば上書きする。"""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if dest.resolve() == src.resolve():
+        return dest
+    if move:
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(src), str(dest))
+    else:
+        shutil.copy2(src, dest)  # 既存ファイルは上書きされる
+    return dest
+
+
 # ---------------------------------------------------------------- マニュアル
 
 README_PATH = APP_DIR / "README.md"
 
 FALLBACK_MANUAL = """## マニュアル
 
-README.md が見つかりませんでした。アプリと同じ場所に README.md を置いてください。
+README.md が見つかりませんでした。アプリと同じフォルダに README.md を置いてください。
 
 ### 基本の流れ
-1. **① 写真を追加** — 仕分けしたい写真をアップロード
-2. **② 解析** — 「未解析を解析」を押す（参照画像の登録は自動）
-3. **③ レビュー** — 自動判定を確認し、違うところだけ直す
-4. **④ 出力** — ZIP をダウンロード
+1. **① 解析** タブ →「参照画像を解析」→「解析を実行」
+2. **② レビュー** タブ → 複数顔の写真で各顔の人物を確定
+3. **③ 出力** タブ → ドライランで確認してからファイル出力
 """
 
 
@@ -836,7 +1120,7 @@ def manual_dialog():
 
 # ---------------------------------------------------------------- サイドバー
 
-st.title("顔認証 写真仕分け for v-varen NAGASAKI")
+st.title("🧑‍🤝‍🧑 顔認証による写真仕分け")
 
 ss = st.session_state
 ss.setdefault("ref_failed", None)
@@ -844,26 +1128,34 @@ ss.setdefault("photos", None)
 ss.setdefault("review_idx", 0)
 ss.setdefault("job", None)
 ss.setdefault("open_pi", None)
+ss.setdefault("image_dir", str(DEFAULT_IMAGE))
 
 _missing = check_deps()
 if _missing:
-    st.error("必要なパッケージが不足しています: " + ", ".join(_missing)
-             + "　（requirements.txt を確認してください）")
-    st.stop()
+    st.error("**必要なパッケージが不足しています: " + ", ".join(_missing) + "**")
+    st.markdown(
+        f"""
+ターミナルで次を実行してください（**このアプリを起動している Python 環境**に入れる必要があります）：
 
-# セッションごとの作業場所（ブラウザを閉じると破棄されます）
-for key, prefix in (("workdir", "photos_"), ("ref_extra_dir", "refadd_"),
-                    ("learn_dir", "learn_")):
-    if key not in ss:
-        ss[key] = tempfile.mkdtemp(prefix=prefix)
-WORKDIR = Path(ss["workdir"])          # アップロードされた写真
-REF_EXTRA = Path(ss["ref_extra_dir"])  # このセッションで追加された参照画像
-LEARN_DIR = Path(ss["learn_dir"])      # このセッションで覚えた顔
+```bash
+"{Path(sys.executable)}" -m pip install {' '.join(_missing)}
+```
+
+インストール後、ブラウザのページを再読み込み（⌘R）してください。
+"""
+    )
+    st.stop()
 
 with st.sidebar:
     if st.button("📖 マニュアルを開く", use_container_width=True):
         manual_dialog()
     st.divider()
+
+    st.header("フォルダ設定")
+    ref_dir = DEFAULT_REF  # 参照フォルダは固定（追加は「👥 人物一覧」タブから）
+    image_dir = folder_row("image_dir", "対象フォルダ（仕分けする写真）")
+    # 出力先は対象フォルダと同じ階層の output/（無ければ出力時に作成）
+    output_dir = image_dir.parent / "output"
 
     st.header("認証パラメータ")
     threshold = st.slider(
@@ -919,83 +1211,137 @@ with st.sidebar:
              "横顔・斜め後ろなど、証明写真では判定できない角度に強くなります。"
              "自動判定のままの顔は学習しません（誤りを覚えないため）。",
     )
-    _base_n = len(load_learned(REF_DIR)[0])
-    _sess_n = len(load_learned(LEARN_DIR)[0])
-    st.caption(f"同梱の学習データ {_base_n} 件 ＋ このセッション {_sess_n} 件。"
-               "セッション分はブラウザを閉じると消えます"
-               "（「👥 人物一覧」タブから書き出して次回持ち込めます）。")
+    _lo, _lm, _ls = load_learned(DEFAULT_REF)
+    st.caption(f"蓄積 {len(_lo)} 件（{len(set(_lo))} 名）／`{DEFAULT_REF.name}/` に保存。"
+               "**対象フォルダを変えても引き継がれます**")
+
+    st.header("サポーターの除外")
+    use_sup = st.checkbox(
+        "サポーター（観客）を無視する", value=True,
+        help="その写真で最も大きく写っている顔（主役）に比べて、小さく不鮮明な顔を無視します。"
+             "観客席・サイドラインの人が選手として認識されるのを防ぎます。"
+             "解析後に変えても再解析は不要です。",
+    )
+    with st.expander("サポーター除外の詳細", expanded=False):
+        sup_rel_size = st.slider(
+            "主役に対する顔の大きさ (%)", 0, 100, 60, 5, disabled=not use_sup,
+            help="主役の顔の大きさのこの割合より小さく、かつ下の鮮明度も満たさない顔を無視します。"
+                 "0 でこの条件を使いません。")
+        sup_rel_sharp = st.slider(
+            "主役に対する鮮明度 (%)", 0, 100, 50, 5, disabled=not use_sup,
+            help="主役の鮮明度のこの割合より不鮮明、かつ上の大きさも満たさない顔を無視します。"
+                 "0 でこの条件を使いません。")
+        sup_small_px = st.slider(
+            "小さい顔とみなす大きさ (px)", 0, 200, 80, 5, disabled=not use_sup,
+            help="これより小さい顔は特徴が乏しく誤認識しやすいため、しきい値を上乗せします。")
+        sup_small_bonus = st.slider(
+            "小さい顔のしきい値の上乗せ", 0.00, 0.30, 0.10, 0.01, disabled=not use_sup)
+        sup_margin = st.slider(
+            "1位と2位の最小の差", 0.00, 0.20, 0.05, 0.01, disabled=not use_sup,
+            help="1位と2位の類似度の差がこれ未満の顔は、誰とも言い切れないので採用しません。"
+                 "0 で無効。")
+    sup = ({"rel_size": sup_rel_size / 100, "rel_sharp": sup_rel_sharp / 100,
+            "small_px": sup_small_px, "small_bonus": sup_small_bonus,
+            "margin": sup_margin} if use_sup else None)
+
+    st.header("シーン（連写）")
+    scene_mode = st.selectbox(
+        "連写シーンの扱い", [SCENE_OFF, SCENE_FILL, SCENE_EXPAND, SCENE_FOLDER],
+        help="撮影時刻から連写のまとまり（シーン）を見つけて、仕分けに使います。\n\n"
+             f"- **{SCENE_FILL}**: 顔で判定できなかった写真に、同じシーンの人物を引き継ぎます"
+             "（人物が1人に絞れるシーンのみ）\n"
+             f"- **{SCENE_EXPAND}**: シーン内の全写真を、そのシーンの人物のフォルダにも入れます\n"
+             f"- **{SCENE_FOLDER}**: 人物ではなく「{SCENE_PREFIX}01」などのフォルダに入れます"
+             "（マスコットなど人物で分けられない連写向け）\n\n"
+             "レビューで確定した写真は変更されません。",
+    )
+    with st.expander("シーン判定の詳細", expanded=False):
+        burst_gap = st.slider(
+            "連写とみなす間隔（秒）", 0.1, 1.0, 0.5, 0.05,
+            help="これ以下の間隔で撮った隣り合う写真を連写とみなします。")
+        link_gap = st.slider(
+            "つなぐ間隔（秒）", 0.5, 3.0, 1.0, 0.1,
+            help="連写の途中で一瞬止まっても、この間隔以内なら同じシーンとしてつなぎます。")
+        min_frames = st.number_input(
+            "シーンの最小枚数", 3, 20, 3, step=1,
+            help="これ未満の連写はシーンにしません（手で1枚ずつ撮った写真の誤判定を防ぎます）。")
+        bridge_gap = st.slider(
+            "短い連写を隣のシーンに合流する間隔（秒）", 0.0, 5.0, 3.0, 0.5,
+            help="2枚だけの連写が、この間隔以内に別のシーンの直前・直後にあれば合流させます。")
+        min_support = st.number_input(
+            "人物を引き継ぐのに必要な確定枚数", 1, 10, 2, step=1,
+            help="シーン内でこの枚数以上に判定された人物だけを、そのシーンの人物とみなします。",
+            disabled=scene_mode not in (SCENE_FILL, SCENE_EXPAND))
+        scene_keep_persons = st.checkbox(
+            "シーンフォルダに加えて人物フォルダにも入れる", value=False,
+            disabled=scene_mode != SCENE_FOLDER,
+            help="顔で判定できた人物のフォルダにも、同じ写真をコピーします。")
 
     st.header("出力設定")
+    op_mode = st.radio("ファイル操作", ["コピー", "移動"], index=0, horizontal=True)
     save_unmatched = st.checkbox(f"該当なしの写真も {OTHER_NAME}/ に入れる", value=True,
                                  help="誰にも該当しなかった写真を、一覧にない人と同じフォルダにまとめます。")
 
-    st.divider()
-    st.caption("アップロードした写真はブラウザを閉じると自動的に破棄されます。")
+# ---------------------------------------------------------------- 概要
 
-# ---------------------------------------------------------------- 参照と対象
+people = collect_refs(ref_dir)
+targets = list_targets(image_dir)
 
-people = collect_all_refs(REF_DIR, REF_EXTRA)
-extra_names = sorted({p.stem for p in REF_EXTRA.rglob("*")
-                      if p.suffix.lower() in IMG_EXTS})
+# 対象フォルダを開いたとき、保存済みの作業状態があれば読み込む
+if ss.get("loaded_dir") != str(image_dir):
+    restored = load_state(image_dir)
+    ss["photos"] = restored
+    ss["job"] = None
+    ss["review_idx"] = 0
+    ss["open_pi"] = None
+    ss["loaded_dir"] = str(image_dir)
+    if restored:
+        st.toast(f"前回の作業状態を読み込みました（{len(restored)} 枚）")
 all_names = sorted(people.keys())
-targets = sorted(p for p in WORKDIR.iterdir() if p.suffix.lower() in IMG_EXTS)
 
-if not people:
-    st.error("参照画像が見つかりません（ref/ が空です）。")
-    st.stop()
+# 連写のまとまり（シーン）。解析結果ではなく撮影時刻だけで決まるので、解析前でも求められる
+scene_of: dict[str, int] = {}
+if scene_mode != SCENE_OFF:
+    _stamps = []
+    for _p in targets:
+        try:
+            _stamps.append((str(_p), capture_time(str(_p), _p.stat().st_mtime)))
+        except OSError:
+            pass
+    scene_of = detect_scenes(_stamps, burst_gap, link_gap,
+                             max(1, int(min_frames) - 1), bridge_gap)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("登録人物数", len(people))
 c2.metric("参照画像数", sum(len(v) for v in people.values()))
-c3.metric("アップロード済み", len(targets))
+c3.metric("対象写真数", len(targets))
 c4.metric("解析済み", len(ss["photos"]) if ss["photos"] else 0)
 
-(tab_upload, tab_run, tab_review, tab_apply, tab_result,
- tab_people, tab_manual) = st.tabs(
-    ["① 写真を追加", "② 解析", "③ レビュー", "④ 出力", "⑤ 結果",
-     "👥 人物一覧", "📖 マニュアル"]
-)
-
-# ---------------------------------------------------------------- ① 写真を追加
-
-with tab_upload:
-    st.info("**アップロードされた写真はサーバー上で一時的に処理され、"
-            "セッション終了後に削除されます。**\n\n"
-            "顔画像は個人情報にあたります。ご本人の同意が得られている写真のみをご利用ください。",
-            icon="🔒")
-    ups = st.file_uploader(
-        f"仕分けする写真を選択（複数可 / 最大 {MAX_FILES} 枚）",
-        type=UPLOAD_TYPES, accept_multiple_files=True, key="photo_uploader",
-    )
-    if ups:
-        if len(ups) > MAX_FILES:
-            st.warning(f"{MAX_FILES} 枚を超えた分は無視されます。")
-            ups = ups[:MAX_FILES]
-        saved = 0
-        for uf in ups:
-            dest = WORKDIR / Path(uf.name).name
-            if not dest.exists() or dest.stat().st_size != uf.size:
-                dest.write_bytes(uf.getbuffer())
-                saved += 1
-        st.success(f"{len(ups)} 枚を受け付けました（新規 {saved} 枚）。"
-                   "「② 解析」へ進んでください。")
-
-    if targets and st.button("アップロードした写真をすべて削除"):
-        for f in targets:
-            f.unlink(missing_ok=True)
-        ss["photos"] = None
-        ss["job"] = None
-        ss["zip_bytes"] = None
+if not people:
+    st.error(f"参照画像が見つかりません: {ref_dir}")
+    st.markdown(NAMING_RULE)
+    first_refs = st.file_uploader("参照画像を選択（複数可）", type=UPLOAD_TYPES,
+                                  accept_multiple_files=True, key="ref_uploader_first")
+    if first_refs and st.button("参照画像を追加", type="primary"):
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        for uf in first_refs:
+            (ref_dir / Path(uf.name).name).write_bytes(uf.getbuffer())
         st.rerun()
+    st.stop()
+
+tab_people, tab_run, tab_review, tab_apply, tab_result, tab_manual = st.tabs(
+    ["👥 人物一覧", "① 解析", "② レビュー", "③ 出力", "④ 結果", "📖 マニュアル"]
+)
 
 # ---------------------------------------------------------------- 人物一覧タブ
 
 with tab_people:
-    with st.expander("➕ 参照画像を追加する（このセッション限り）"):
+    with st.expander("➕ 参照画像を追加する"):
         st.markdown(NAMING_RULE)
         dest_kind = st.radio(
             "保存先",
-            ["選手など", "スタッフ", "その他の関係者"],
+            [f"選手など（{ref_dir.name}/ 直下）", f"スタッフ（{ref_dir.name}/staff/）",
+             f"その他の関係者（{ref_dir.name}/etc/）"],
             horizontal=True, key="ref_up_kind",
         )
         new_refs = st.file_uploader(
@@ -1012,8 +1358,8 @@ with tab_people:
                            + ", ".join(odd[:5]))
 
         if st.button("参照画像を追加", type="primary", disabled=not new_refs):
-            sub = "staff" if "スタッフ" in dest_kind else ("etc" if "その他" in dest_kind else "")
-            dest_dir = REF_EXTRA / sub if sub else REF_EXTRA
+            sub = "staff" if "スタッフ" in dest_kind else ("etc" if "/etc/" in dest_kind else "")
+            dest_dir = ref_dir / sub if sub else ref_dir
             dest_dir.mkdir(parents=True, exist_ok=True)
             added, replaced = [], []
             for uf in new_refs:
@@ -1023,39 +1369,28 @@ with tab_people:
             msg = f"{len(added)} 件を追加しました。" if added else ""
             if replaced:
                 msg += f"{len(replaced)} 件を上書きしました（{', '.join(replaced[:3])}…）。"
-            st.success(msg + "次回の解析時に自動で登録されます（このセッション限り）。")
+            st.success(msg + "次回の解析時に自動で登録されます。")
             st.rerun()
 
-    # ---- 学習データ（同梱ぶん＋このセッションぶん）----
-    b_owners, _bm, _bs = load_learned(REF_DIR)
-    s_owners, s_matrix, s_srcs = load_learned(LEARN_DIR)
-    with st.expander(f"🧠 覚えた顔: 同梱 {len(b_owners)} 件 ＋ このセッション {len(s_owners)} 件"):
-        st.caption("レビューで人物を選び直した顔です。次の解析から照合に使われます。"
-                   "**このセッションぶんはブラウザを閉じると消えます。**"
-                   "書き出して保存しておけば、次回アップロードして引き継げます。")
-        if s_owners:
-            cnt: dict[str, int] = defaultdict(int)
-            for n in s_owners:
-                cnt[n] += 1
-            st.markdown("\n".join(f"- {short_label(n)}: {c} 件" for n, c in
-                                  sorted(cnt.items(), key=lambda x: -x[1])))
-        c1, c2, c3 = st.columns(3)
-        if s_owners and learned_path(LEARN_DIR).is_file():
-            c1.download_button("💾 学習データを書き出す",
-                               learned_path(LEARN_DIR).read_bytes(),
-                               file_name=LEARNED_FILE.lstrip("."),
-                               mime="application/octet-stream")
-        if s_owners and c2.button("このセッションの学習を削除"):
-            learned_path(LEARN_DIR).unlink(missing_ok=True)
-            st.rerun()
-        up_learn = c3.file_uploader("前回の学習データを読み込む", type=["npz"],
-                                    key="learn_upload", label_visibility="collapsed")
-        if up_learn is not None:
-            learned_path(LEARN_DIR).write_bytes(up_learn.getbuffer())
-            st.success("学習データを読み込みました。")
-            st.rerun()
-        st.caption("恒久的に反映するには、書き出したファイルを `ref/.learned.npz` として"
-                   "リポジトリにコミットしてください（全利用者に反映されます）。")
+    l_owners, l_matrix, l_srcs = load_learned(ref_dir)
+    if l_owners:
+        cnt: dict[str, int] = defaultdict(int)
+        for n in l_owners:
+            cnt[n] += 1
+        with st.expander(f"🧠 修正から覚えた顔: {len(l_owners)} 件（{len(cnt)} 名）"):
+            st.caption("レビューで人物を選び直した顔です。次回の解析から照合に使われます。")
+            st.markdown("\n".join(
+                f"- {short_label(n)}: {c} 件" for n, c in
+                sorted(cnt.items(), key=lambda x: -x[1])))
+            c1, c2 = st.columns(2)
+            if c1.button("学習データをすべて削除"):
+                learned_path(ref_dir).unlink(missing_ok=True)
+                st.rerun()
+            c2.download_button("元になった写真の一覧 (CSV)",
+                               ("人物,写真\n" + "\n".join(
+                                   f"{short_label(n)},{s2}" for n, s2 in zip(l_owners, l_srcs))
+                                ).encode("utf-8-sig"),
+                               file_name="learned_faces.csv", mime="text/csv")
 
     groups = group_by_position(all_names)
     ref_failed = ss.get("ref_failed")
@@ -1091,13 +1426,10 @@ with tab_people:
 
 with tab_run:
     st.caption("この段階ではファイルは書き込みません。各写真の顔と候補人物を記録します。"
-               "ヴィヴィくんは人では無いので顔認証で利用されません。"
                "何回かに分けて解析でき、結果は積み上がります。"
                "参照画像の登録は初回の解析時に自動で行われます"
                "（参照画像を追加・変更したときだけ自動で登録し直します）。")
 
-    if not targets:
-        st.info("先に「① 写真を追加」で写真をアップロードしてください。")
     analyzed = {p["path"] for p in (ss["photos"] or [])}
     pending = [p for p in targets if str(p) not in analyzed]
 
@@ -1137,7 +1469,7 @@ with tab_run:
         ss["job"] = None
         ss["photos"] = None
         ss["review_idx"] = 0
-        state_path(WORKDIR).unlink(missing_ok=True)
+        state_path(image_dir).unlink(missing_ok=True)
         st.rerun()
 
     # --- 進捗表示 ---
@@ -1176,21 +1508,13 @@ with tab_run:
     if status == "running":
         model = get_model(det_size, det_thresh)
         ref_owner, ref_matrix, ref_failed = build_reference(
-            ref_signature(REF_DIR), str(REF_DIR), det_size, det_thresh)
-        if extra_names:
-            e_owner, e_matrix, e_failed = build_reference(
-                ref_signature(REF_EXTRA), str(REF_EXTRA), det_size, det_thresh)
-            if e_matrix.shape[0]:
-                ref_owner = list(ref_owner) + list(e_owner)
-                ref_matrix = np.concatenate([ref_matrix, e_matrix], axis=0)
-            ref_failed = list(ref_failed) + list(e_failed)
+            ref_signature(ref_dir), str(ref_dir), det_size, det_thresh)
         ss["ref_failed"] = ref_failed
-        # 覚えた顔も参照に加える（リポジトリ同梱ぶん＋このセッションぶん）
-        for _dir in (REF_DIR, LEARN_DIR):
-            l_owners, l_matrix, _ = load_learned(_dir)
-            if l_matrix.shape[0]:
-                ref_owner = list(ref_owner) + l_owners
-                ref_matrix = np.concatenate([ref_matrix, l_matrix], axis=0)
+        # 手動修正から覚えた顔も参照に加える
+        l_owners, l_matrix, _ = load_learned(ref_dir)
+        if l_matrix.shape[0]:
+            ref_owner = list(ref_owner) + l_owners
+            ref_matrix = np.concatenate([ref_matrix, l_matrix], axis=0)
         if ref_matrix.shape[0] == 0:
             ss["job"] = None
             st.error("参照画像から顔を検出できませんでした。")
@@ -1199,16 +1523,27 @@ with tab_run:
         num_map = build_number_map(all_names)
         if use_numbers and ocr is None and job["cursor"] == 0:
             st.warning(f"背番号の読み取りを使えませんでした（{ocr_err}）。"
-                       "今回は顔認証のみで解析します。"
-                       "`requirements.txt` に `rapidocr_onnxruntime` があるか確認してください。")
+                       "今回は顔認証のみで解析します。")
+            st.caption(
+                "インストール済みなのにこの表示が出る場合は、**アプリを起動したまま "
+                "pip install した**可能性があります。ターミナルで Streamlit を一度止めて "
+                "（Ctrl+C）、起動し直してください。\n\n"
+                f"インストール先の確認: `\"{Path(sys.executable)}\" "
+                "-c \"import rapidocr_onnxruntime, sys; print(sys.executable)\"`"
+            )
 
         t0 = time.time()
         while job["cursor"] < len(job["todo"]) and time.time() - t0 < CHUNK_SECONDS:
             path = Path(job["todo"][job["cursor"]])
+            try:
+                _st = path.stat()
+                fp = {"mtime": int(_st.st_mtime), "fsize": _st.st_size}
+            except OSError:
+                fp = {}
             img = read_image(path)
             if img is None:
                 job["photos"].append(
-                    {"path": str(path), "name": path.name, "faces": [], "error": "読込失敗"})
+                    {"path": str(path), "name": path.name, "faces": [], "error": "読込失敗", **fp})
                 job["cursor"] += 1
                 continue
 
@@ -1233,7 +1568,7 @@ with tab_run:
                     "sharp": round(getattr(f, "sharp", 0.0), 1),
                     "cands": [(n, round(s, 4)) for n, s in cands],
                 })
-            rec = {"path": str(path), "name": path.name, "faces": faces_meta}
+            rec = {"path": str(path), "name": path.name, "faces": faces_meta, **fp}
             if is_crowd:
                 rec["crowd"] = True
 
@@ -1252,7 +1587,7 @@ with tab_run:
 
         job["elapsed"] += time.time() - t0
         merge_photos(job["photos"])  # 途中結果も随時反映（中断しても失われない）
-        save_state(WORKDIR)
+        save_state(image_dir)
         if job["cursor"] >= len(job["todo"]):
             job["status"] = "done"
         st.rerun()
@@ -1261,7 +1596,7 @@ with tab_run:
 
 with tab_review:
     if not ss["photos"]:
-        st.info("先に「② 解析」を実行してください。")
+        st.info("先に「① 解析」を実行してください。")
     else:
         photos = ss["photos"]
 
@@ -1273,7 +1608,8 @@ with tab_review:
         )
 
         def _needs_check(p: dict) -> bool:
-            if not derive_assignment(p, threshold, min_face_px, top_only, min_sharp=min_sharp):
+            if not derive_assignment(p, threshold, min_face_px, top_only,
+                                     min_sharp=min_sharp, sup=sup):
                 return True
             best = max((c[1] for f in p["faces"] for c in f["cands"][:1]), default=0.0)
             return best < threshold + 0.05
@@ -1355,11 +1691,11 @@ with tab_review:
                     emb = embed_face(model_, img_, f["bbox"], f.get("kps"))
                     if emb is None:
                         continue
-                    add_learned(LEARN_DIR, name, emb, photo_["name"])
+                    add_learned(ref_dir, name, emb, photo_["name"])
                     f["learned"] = name
                     done.append(short_label(name))
                 if done:
-                    save_state(WORKDIR)
+                    save_state(image_dir)
                     st.toast("覚えました: " + "、".join(done))
 
             def autosave(idx: int) -> None:
@@ -1370,7 +1706,7 @@ with tab_review:
                 sel, ext = state
                 picked = sorted({n for n in sel if n} | set(ext))
                 auto = derive_assignment({"faces": photos[idx]["faces"]}, threshold,
-                                         min_face_px, top_only, min_sharp=min_sharp)
+                                         min_face_px, top_only, min_sharp=min_sharp, sup=sup)
                 # 自動判定は類似度順、こちらは名前順なので集合で比べる
                 if set(picked) != set(auto) or photos[idx].get("manual") is not None:
                     changed = photos[idx].get("manual") != picked
@@ -1378,7 +1714,7 @@ with tab_review:
                     photos[idx]["manual_extra"] = ext
                     photos[idx]["manual"] = picked
                     if changed:
-                        save_state(WORKDIR)
+                        save_state(image_dir)
                     if use_learning:
                         learn_corrections(idx, sel)
 
@@ -1390,7 +1726,7 @@ with tab_review:
             autosave(pi)
             if not photo.get("seen"):
                 photo["seen"] = True          # レビュー画面で開いた印
-                save_state(WORKDIR)
+                save_state(image_dir)
             ss["open_pi"] = pi
 
             nav1, nav2, _ = st.columns([1, 1, 6])
@@ -1407,6 +1743,12 @@ with tab_review:
                            "照合しました（観客席とみなして残りは無視）。"
                            "足りない人は「名前で追加する」から選べます。")
 
+            if photo["path"] in scene_of:
+                no = scene_of[photo["path"]]
+                mates = [p_["name"] for p_ in photos if scene_of.get(p_["path"]) == no]
+                st.caption(f"🎞 {SCENE_PREFIX}{no:02d}（解析済み {len(mates)} 枚: "
+                           f"{mates[0]} 〜 {mates[-1]}）")
+
             left, right = st.columns([3, 5])
             with left:
                 if img is not None:
@@ -1418,13 +1760,14 @@ with tab_review:
 
                 # --- 顔ごとの初期値をあらかじめ決めておく（表示は下段だが値は先に必要） ---
                 face_setup = []
+                is_supporter = supporter_mask(photo["faces"], min_face_px, sup)
                 for k, f in enumerate(photo["faces"]):
                     score_map = {n: s for n, s in f["cands"]}
                     options = (list(score_map)
                                + [n for n in all_names if n not in score_map]
                                + [OTHER_NAME])
-                    ok = usable_face(f, min_face_px, min_sharp)
-                    confident = bool(ok and f["cands"] and f["cands"][0][1] >= threshold)
+                    ok = usable_face(f, min_face_px, min_sharp) and not is_supporter[k]
+                    confident = bool(ok and top_confident(f, threshold, sup))
                     auto_name = f["cands"][0][0] if confident else OTHER_NAME
                     if prev_faces is not None and k < len(prev_faces):
                         default = prev_faces[k] or auto_name
@@ -1512,7 +1855,9 @@ with tab_review:
                                 note = f"顔{k + 1} / {f['size']}px"
                                 if "sharp" in f:
                                     note += f" / ボケ度 {f['sharp']:.0f}"
-                                if not ok:
+                                if is_supporter[k]:
+                                    note += "（サポーターとみなして対象外）"
+                                elif not ok:
                                     note += "（対象外）"
                                 st.caption(note)
                 else:
@@ -1531,7 +1876,7 @@ with tab_review:
                     photo.pop("manual_extra", None)
                     photo["manual"] = derive_assignment(
                         {"faces": photo["faces"]}, threshold, min_face_px, top_only,
-                        min_sharp=min_sharp)
+                        min_sharp=min_sharp, sup=sup)
                     if pick < len(queue) - 1:
                         ss["review_idx"] = pick + 1
                     st.rerun()
@@ -1541,69 +1886,98 @@ with tab_review:
                         photo.pop(key, None)
                     st.rerun()
 
-# ---------------------------------------------------------------- ④ 出力（ZIP）
+# ---------------------------------------------------------------- 出力タブ
 
 with tab_apply:
     if not ss["photos"]:
-        st.info("先に「② 解析」を実行してください。")
+        st.info("先に「① 解析」を実行してください。")
     else:
         photos = ss["photos"]
-        plan = {i: derive_assignment(p, threshold, min_face_px, top_only, min_sharp=min_sharp)
-                for i, p in enumerate(photos)}
+        plan, scene_notes = build_plan(photos, threshold, min_face_px, top_only, min_sharp,
+                                       sup, scene_mode, scene_of, int(min_support),
+                                       scene_keep_persons)
         counter: dict[str, int] = defaultdict(int)
         for names in plan.values():
             for n in names:
                 counter[n] += 1
-        n_unmatched = sum(1 for v in plan.values() if not v)
+        unmatched = [i for i, n in plan.items() if not n]
 
         m1, m2, m3 = st.columns(3)
         m1.metric("仕分けされる件数", sum(counter.values()))
-        m2.metric("フォルダ数", len(counter))
-        m3.metric("該当なしの写真", n_unmatched)
-        st.caption("しきい値などを変えると、再解析なしでこの内容が更新されます。"
-                   "レビューで確定した写真は手動の内容が優先されます。")
+        m2.metric("作成フォルダ数", len(counter))
+        m3.metric("該当なしの写真", len(unmatched))
 
-        est_mb = estimate_zip_size(plan, photos, save_unmatched) / 1024 / 1024
-        size_mode = st.radio(
-            "ZIP に入れる画像",
-            [f"オリジナル画質（約 {est_mb:.0f} MB）", "長辺1600pxに縮小（軽量）"],
-            index=0 if est_mb <= ZIP_WARN_MB else 1,
-            help="複数人が写った写真は人数分コピーされるため、合計は元より大きくなります。",
+        st.caption("しきい値・最小顔サイズを変更すると、再解析なしでこの内容が更新されます。"
+                   "レビューで確定済みの写真は手動選択が優先されます。")
+        if scene_mode != SCENE_OFF:
+            n_scenes = len(set(scene_of.values()))
+            st.caption(f"🎞 連写シーン: {n_scenes} 個（{len(scene_of)} 枚）／"
+                       f"{scene_mode}: {len(scene_notes)} 枚に適用")
+
+        n_done = sum(1 for p in photos if p.get("exported"))
+        only_new = st.checkbox(
+            f"まだ出力していない写真だけ（出力済み {n_done} 枚をスキップ）",
+            value=bool(n_done), disabled=not n_done,
+            help="追加で解析した分だけを書き出したいときに使います。"
+                 "レビューで内容を変えた写真は、出力済みでも再出力されます。",
         )
-        shrink_to = None if size_mode.startswith("オリジナル") else 1600
-
-        too_big = est_mb > ZIP_LIMIT_MB and shrink_to is None
-        if too_big:
-            st.error(f"ZIP が約 {est_mb:.0f} MB と大きすぎます（上限 {ZIP_LIMIT_MB} MB）。"
-                     "「長辺1600pxに縮小」を選ぶか、写真を分けて処理してください。")
-        elif est_mb > ZIP_WARN_MB and shrink_to is None:
-            st.warning(f"ZIP が約 {est_mb:.0f} MB になります。作成に時間がかかります。")
-
-        d1, d2 = st.columns(2)
-        with d1:
-            if st.button("ZIP を作成", type="primary", disabled=too_big):
-                bar = st.progress(0.0, "ZIP を作成中…")
-                ss["zip_bytes"] = build_zip(
-                    plan, photos, save_unmatched, shrink_to,
-                    progress=lambda r: bar.progress(min(r, 1.0), "ZIP を作成中…"))
-                bar.empty()
-            if ss.get("zip_bytes"):
-                mb = len(ss["zip_bytes"]) / 1024 / 1024
-                st.download_button(f"📦 仕分け済みZIPをダウンロード ({mb:.1f} MB)",
-                                   ss["zip_bytes"], file_name="sorted_photos.zip",
-                                   mime="application/zip", type="primary")
+        dry_run = st.checkbox("ドライラン（実際には書き込まない）", value=True)
+        clean_first = st.checkbox(
+            "出力前に人物フォルダを削除する（前回の結果を残さない）", value=False,
+            help=f"{output_dir} の中のフォルダをすべて消してから書き出します。"
+                 "レビューで外した人のフォルダに前回の写真が残るのを防げます。",
+        )
+        st.caption("出力先に同じファイル名が既にある場合は上書きされます。"
+                   "設定を変えて出力し直すときは、上のチェックを入れると前回の結果が残りません。")
+        if st.button("ファイルを出力", type="primary"):
+            if clean_first and not dry_run and output_dir.is_dir():
+                for d in output_dir.iterdir():
+                    if d.is_dir():
+                        shutil.rmtree(d, ignore_errors=True)
+            bar = st.progress(0.0, "出力中…")
+            written = skipped = 0
+            for j, (i, names) in enumerate(plan.items(), 1):
+                src = Path(photos[i]["path"])
+                if not src.exists():
+                    continue
+                # 出力済みで、その後レビューで変えていない写真は飛ばす
+                if only_new and photos[i].get("exported") == names:
+                    skipped += 1
+                    bar.progress(j / len(plan), f"{j}/{len(plan)}")
+                    continue
+                for n in names:
+                    if not dry_run:
+                        # 複数人に振り分ける写真は移動できないためコピー
+                        move = (op_mode == "移動") and len(names) == 1
+                        put_file(src, output_dir / n, move=move)
+                    written += 1
+                if not names and save_unmatched and not dry_run:
+                    put_file(src, output_dir / OTHER_NAME, move=False)
+                if not dry_run:
+                    photos[i]["exported"] = list(names)
+                bar.progress(j / len(plan), f"{j}/{len(plan)}")
+            bar.empty()
+            if not dry_run:
+                save_state(image_dir)
+            msg = (f"{written} 件を {len(counter)} フォルダに出力しました。"
+                   if not dry_run
+                   else f"ドライラン：{written} 件が出力対象です（書き込みなし）。")
+            if skipped:
+                msg += f"（出力済みの {skipped} 枚はスキップ）"
+            st.success(msg)
 
 # ---------------------------------------------------------------- 結果タブ
 
 with tab_result:
     if not ss["photos"]:
-        st.info("先に「② 解析」を実行してください。")
+        st.info("先に「① 解析」を実行してください。")
     else:
         import pandas as pd
 
         photos = ss["photos"]
-        plan = {i: derive_assignment(p, threshold, min_face_px, top_only, min_sharp=min_sharp)
-                for i, p in enumerate(photos)}
+        plan, scene_notes = build_plan(photos, threshold, min_face_px, top_only, min_sharp,
+                                       sup, scene_mode, scene_of, int(min_support),
+                                       scene_keep_persons)
         counter: dict[str, int] = defaultdict(int)
         for names in plan.values():
             for n in names:
@@ -1613,7 +1987,10 @@ with tab_result:
         if counter:
             rows = []
             for name, cnt in counter.items():
-                pos, num, person = parse_person(name)
+                if is_scene_name(name):
+                    pos, num, person = "シーン", "", name
+                else:
+                    pos, num, person = parse_person(name)
                 rows.append({"ポジション": pos, "番号": num, "選手": person, "枚数": cnt})
             df_c = pd.DataFrame(rows).sort_values("枚数", ascending=False)
             cc1, cc2 = st.columns([1, 1])
@@ -1629,8 +2006,12 @@ with tab_result:
                     "ファイル": p["name"],
                     "顔数": len(p["faces"]),
                     "確定": ("手動" if p.get("manual") is not None
-                             else ("観客席（一部）" if p.get("crowd") else "自動")),
-                    "判定人物": ", ".join(short_label(n) for n in plan[i]) or "—",
+                             else scene_notes.get(i)
+                             or ("観客席（一部）" if p.get("crowd") else "自動")),
+                    "シーン": (f"{SCENE_PREFIX}{scene_of[p['path']]:02d}"
+                              if p["path"] in scene_of else "—"),
+                    "判定人物": ", ".join(n if is_scene_name(n) else short_label(n)
+                                      for n in plan[i]) or "—",
                     "最高類似度": round(best, 3),
                     "背番号": ", ".join(n for n, _, _ in (p.get("numbers") or [])) or "—",
                 }
